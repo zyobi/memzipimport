@@ -42,6 +42,7 @@ struct _zipimporter {
 
 static PyObject *ZipImportError;
 static PyObject *zip_directory_cache = NULL;
+static PyObject *zip_content = NULL;
 
 /* forward decls */
 static PyObject *read_directory(char *archive);
@@ -60,8 +61,10 @@ static PyObject *get_module_code(ZipImporter *self, char *fullname,
 static int
 zipimporter_init(ZipImporter *self, PyObject *args, PyObject *kwds)
 {
-    char *path, *p, *prefix, buf[MAXPATHLEN+2];
+    char *path, *prefix, buf[MAXPATHLEN+2];
     size_t len;
+
+    PyObject *mem_dict;
 
     if (!_PyArg_NoKeywords("zipimporter()", kwds))
         return -1;
@@ -82,46 +85,20 @@ zipimporter_init(ZipImporter *self, PyObject *args, PyObject *kwds)
     }
     strcpy(buf, path);
 
-#ifdef ALTSEP
-    for (p = buf; *p; p++) {
-        if (*p == ALTSEP)
-            *p = SEP;
+    mem_dict = PySys_GetObject("memzip");
+    if (mem_dict == NULL || PyDict_Check(mem_dict) == 0) {
+        PyErr_SetString(ZipImportError,
+                        "memzip not exists");
+        return -1;
     }
-#endif
-
-    path = NULL;
-    prefix = NULL;
-    for (;;) {
-#ifndef RISCOS
-        struct stat statbuf;
-        int rv;
-
-        rv = stat(buf, &statbuf);
-        if (rv == 0) {
-            /* it exists */
-            if (S_ISREG(statbuf.st_mode))
-                /* it's a file */
-                path = buf;
-            break;
-        }
-#else
-        if (object_exists(buf)) {
-            /* it exists */
-            if (isfile(buf))
-                /* it's a file */
-                path = buf;
-            break;
-        }
-#endif
-        /* back up one path element */
-        p = strrchr(buf, SEP);
-        if (prefix != NULL)
-            *prefix = SEP;
-        if (p == NULL)
-            break;
-        *p = '\0';
-        prefix = p;
+    zip_content = PyDict_GetItemString(mem_dict, path);
+    if (zip_content == NULL || PyByteArray_Check(zip_content) == 0) {
+        PyErr_SetString(ZipImportError,
+                        "zip content not found");
+        return -1;
     }
+    Py_INCREF(zip_content);
+
     if (path != NULL) {
         PyObject *files;
         files = PyDict_GetItemString(zip_directory_cache, path);
@@ -142,17 +119,7 @@ zipimporter_init(ZipImporter *self, PyObject *args, PyObject *kwds)
         return -1;
     }
 
-    if (prefix == NULL)
-        prefix = "";
-    else {
-        prefix++;
-        len = strlen(prefix);
-        if (prefix[len-1] != SEP) {
-            /* add trailing SEP */
-            prefix[len] = SEP;
-            prefix[len + 1] = '\0';
-        }
-    }
+    prefix = "";
 
     self->archive = PyString_FromString(buf);
     if (self->archive == NULL)
@@ -181,6 +148,7 @@ zipimporter_dealloc(ZipImporter *self)
     Py_XDECREF(self->archive);
     Py_XDECREF(self->prefix);
     Py_XDECREF(self->files);
+    Py_XDECREF(zip_content);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -600,7 +568,7 @@ zipfile targeted.");
 
 static PyTypeObject ZipImporter_Type = {
     PyVarObject_HEAD_INIT(DEFERRED_ADDRESS(&PyType_Type), 0)
-    "zipimport.zipimporter",
+    "memzipimport.zipimporter",
     sizeof(ZipImporter),
     0,                                          /* tp_itemsize */
     (destructor)zipimporter_dealloc,            /* tp_dealloc */
@@ -661,6 +629,14 @@ get_long(unsigned char *buf) {
     return x;
 }
 
+static short
+get_short(unsigned char *buf) {
+    short x;
+    x =  buf[0];
+    x |= (long)buf[1] <<  8;
+    return x;
+}
+
 /*
    read_directory(archive) -> files dict (new reference)
 
@@ -686,14 +662,14 @@ static PyObject *
 read_directory(char *archive)
 {
     PyObject *files = NULL;
-    FILE *fp;
     long compress, crc, data_size, file_size, file_offset, date, time;
     long header_offset, name_size, header_size, header_position;
     long i, l, count;
     size_t length;
     char path[MAXPATHLEN + 5];
     char name[MAXPATHLEN + 5];
-    char *p, endof_central_dir[22];
+    char *p;
+    unsigned char *content, *endof_central_dir, *header, *file;
     long arc_offset; /* offset from beginning of file to start of zip-archive */
 
     if (strlen(archive) > MAXPATHLEN) {
@@ -703,30 +679,25 @@ read_directory(char *archive)
     }
     strcpy(path, archive);
 
-    fp = fopen(archive, "rb");
-    if (fp == NULL) {
-        PyErr_Format(ZipImportError, "can't open Zip file: "
-                     "'%.200s'", archive);
-        return NULL;
-    }
-    fseek(fp, -22, SEEK_END);
-    header_position = ftell(fp);
-    if (fread(endof_central_dir, 1, 22, fp) != 22) {
-        fclose(fp);
+    content = (unsigned char *)PyByteArray_AsString(zip_content);
+    endof_central_dir = content + PyByteArray_Size(zip_content) - 22;
+    header_position = PyByteArray_Size(zip_content) - 22;
+
+    if (PyByteArray_Size(zip_content) < 22) {
         PyErr_Format(ZipImportError, "can't read Zip file: "
                      "'%.200s'", archive);
         return NULL;
     }
+
     if (get_long((unsigned char *)endof_central_dir) != 0x06054B50) {
         /* Bad: End of Central Dir signature */
-        fclose(fp);
         PyErr_Format(ZipImportError, "not a Zip file: "
                      "'%.200s'", archive);
         return NULL;
     }
 
-    header_size = get_long((unsigned char *)endof_central_dir + 12);
-    header_offset = get_long((unsigned char *)endof_central_dir + 16);
+    header_size = get_long(endof_central_dir + 12);
+    header_offset = get_long(endof_central_dir + 16);
     arc_offset = header_position - header_offset - header_size;
     header_offset += arc_offset;
 
@@ -743,32 +714,32 @@ read_directory(char *archive)
         PyObject *t;
         int err;
 
-        fseek(fp, header_offset, 0);  /* Start of file header */
-        l = PyMarshal_ReadLongFromFile(fp);
+        l = get_long(content + header_offset);
         if (l != 0x02014B50)
             break;              /* Bad: Central Dir File Header */
-        fseek(fp, header_offset + 10, 0);
-        compress = PyMarshal_ReadShortFromFile(fp);
-        time = PyMarshal_ReadShortFromFile(fp);
-        date = PyMarshal_ReadShortFromFile(fp);
-        crc = PyMarshal_ReadLongFromFile(fp);
-        data_size = PyMarshal_ReadLongFromFile(fp);
-        file_size = PyMarshal_ReadLongFromFile(fp);
-        name_size = PyMarshal_ReadShortFromFile(fp);
+        header = content + header_offset + 10;
+        compress = get_short(header); header += 2;
+        time = get_short(header); header += 2;
+        date = get_short(header); header += 2;
+        crc = get_long(header); header += 4;
+        data_size = get_long(header); header += 4;
+        file_size = get_long(header); header += 4;
+        name_size = get_short(header); header += 2;
         header_size = 46 + name_size +
-           PyMarshal_ReadShortFromFile(fp) +
-           PyMarshal_ReadShortFromFile(fp);
-        fseek(fp, header_offset + 42, 0);
-        file_offset = PyMarshal_ReadLongFromFile(fp) + arc_offset;
+           get_short(header) +
+           get_short(header +2);
+        file_offset = get_long(content + header_offset + 42) + arc_offset;
         if (name_size > MAXPATHLEN)
             name_size = MAXPATHLEN;
 
+        file = content + header_offset + 42 + 4;
         p = name;
         for (i = 0; i < name_size; i++) {
-            *p = (char)getc(fp);
+            *p = *file;
             if (*p == '/')
                 *p = SEP;
             p++;
+            file++;
         }
         *p = 0;         /* Add terminating null byte */
         header_offset += header_size;
@@ -785,13 +756,11 @@ read_directory(char *archive)
             goto error;
         count++;
     }
-    fclose(fp);
     if (Py_VerboseFlag)
         PySys_WriteStderr("# zipimport: found %ld names in %s\n",
             count, archive);
     return files;
 error:
-    fclose(fp);
     Py_XDECREF(files);
     return NULL;
 }
@@ -837,13 +806,11 @@ get_data(char *archive, PyObject *toc_entry)
 {
     PyObject *raw_data, *data = NULL, *decompress;
     char *buf;
-    FILE *fp;
-    int err;
-    Py_ssize_t bytes_read = 0;
     long l;
     char *datapath;
     long compress, data_size, file_size, file_offset;
     long time, date, crc;
+    char *content, *file;
 
     if (!PyArg_ParseTuple(toc_entry, "slllllll", &datapath, &compress,
                           &data_size, &file_size, &file_offset, &time,
@@ -851,47 +818,35 @@ get_data(char *archive, PyObject *toc_entry)
         return NULL;
     }
 
-    fp = fopen(archive, "rb");
-    if (!fp) {
-        PyErr_Format(PyExc_IOError,
-           "zipimport: can not open file %s", archive);
-        return NULL;
-    }
-
     /* Check to make sure the local file header is correct */
-    fseek(fp, file_offset, 0);
-    l = PyMarshal_ReadLongFromFile(fp);
+    content = PyByteArray_AsString(zip_content);
+    l = get_long((unsigned char *)content);
     if (l != 0x04034B50) {
         /* Bad: Local File Header */
         PyErr_Format(ZipImportError,
                      "bad local file header in %s",
                      archive);
-        fclose(fp);
         return NULL;
     }
-    fseek(fp, file_offset + 26, 0);
-    l = 30 + PyMarshal_ReadShortFromFile(fp) +
-        PyMarshal_ReadShortFromFile(fp);        /* local header size */
+    file = content + file_offset + 26;
+    l = 30 + get_short(file) +
+        get_short(file + 2);        /* local header size */
     file_offset += l;           /* Start of file data */
 
     raw_data = PyString_FromStringAndSize((char *)NULL, compress == 0 ?
                                           data_size : data_size + 1);
     if (raw_data == NULL) {
-        fclose(fp);
         return NULL;
     }
     buf = PyString_AsString(raw_data);
 
-    err = fseek(fp, file_offset, 0);
-    if (err == 0)
-        bytes_read = fread(buf, 1, data_size, fp);
-    fclose(fp);
-    if (err || bytes_read != data_size) {
+    if ((file_offset + data_size) > PyByteArray_Size(zip_content)) {
         PyErr_SetString(PyExc_IOError,
                         "zipimport: can't read data");
         Py_DECREF(raw_data);
         return NULL;
     }
+    memcpy(buf, content + file_offset, data_size);
 
     if (compress != 0) {
         buf[data_size] = 'Z';  /* saw this in zipfile.py */
@@ -1200,12 +1155,12 @@ initmemzipimport(void)
         zip_searchorder[4] = tmp;
     }
 
-    mod = Py_InitModule4("zipimport", NULL, zipimport_doc,
+    mod = Py_InitModule4("memzipimport", NULL, zipimport_doc,
                          NULL, PYTHON_API_VERSION);
     if (mod == NULL)
         return;
 
-    ZipImportError = PyErr_NewException("zipimport.ZipImportError",
+    ZipImportError = PyErr_NewException("memzipimport.ZipImportError",
                                         PyExc_ImportError, NULL);
     if (ZipImportError == NULL)
         return;

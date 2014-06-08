@@ -38,15 +38,15 @@ struct _zipimporter {
     PyObject *archive;  /* pathname of the Zip archive */
     PyObject *prefix;   /* file prefix: "a/sub/directory/" */
     PyObject *files;    /* dict with file info {path: toc_entry} */
+    PyObject *zip_content;
 };
 
 static PyObject *ZipImportError;
 static PyObject *zip_directory_cache = NULL;
-static PyObject *zip_content = NULL;
 
 /* forward decls */
-static PyObject *read_directory(char *archive);
-static PyObject *get_data(char *archive, PyObject *toc_entry);
+static PyObject *read_directory(char *archive, PyObject *zip_content);
+static PyObject *get_data(char *archive, PyObject *zip_content, PyObject *toc_entry);
 static PyObject *get_module_code(ZipImporter *self, char *fullname,
                                  int *p_ispackage, char **p_modpath);
 
@@ -61,7 +61,7 @@ static PyObject *get_module_code(ZipImporter *self, char *fullname,
 static int
 zipimporter_init(ZipImporter *self, PyObject *args, PyObject *kwds)
 {
-    char *path, *prefix, buf[MAXPATHLEN+2];
+    char *path, *prefix, buf[MAXPATHLEN+2], *p;
     size_t len;
 
     PyObject *mem_dict;
@@ -85,25 +85,51 @@ zipimporter_init(ZipImporter *self, PyObject *args, PyObject *kwds)
     }
     strcpy(buf, path);
 
+    path = buf;
+    prefix = NULL;
+    for (;;) {
+        /* back up one path element */
+        p = strrchr(buf, SEP);
+        if (p == NULL)
+            break;
+        if (prefix != NULL)
+            *prefix = SEP;
+        *p = '\0';
+        prefix = p;
+    }
+
+    if (prefix == NULL)
+        prefix = "";
+    else {
+        prefix++;
+        len = strlen(prefix);
+        if (prefix[len-1] != SEP) {
+            /* add trailing SEP */
+            prefix[len] = SEP;
+            prefix[len + 1] = '\0';
+        }
+    }
+
+
     mem_dict = PySys_GetObject("memzip");
     if (mem_dict == NULL || PyDict_Check(mem_dict) == 0) {
         PyErr_SetString(ZipImportError,
                         "memzip not exists");
         return -1;
     }
-    zip_content = PyDict_GetItemString(mem_dict, path);
-    if (zip_content == NULL || PyByteArray_Check(zip_content) == 0) {
+    self->zip_content = PyDict_GetItemString(mem_dict, path);
+    if (self->zip_content == NULL || PyByteArray_Check(self->zip_content) == 0) {
         PyErr_SetString(ZipImportError,
                         "zip content not found");
         return -1;
     }
-    Py_INCREF(zip_content);
+    Py_INCREF(self->zip_content);
 
     if (path != NULL) {
         PyObject *files;
         files = PyDict_GetItemString(zip_directory_cache, path);
         if (files == NULL) {
-            files = read_directory(buf);
+            files = read_directory(buf, self->zip_content);
             if (files == NULL)
                 return -1;
             if (PyDict_SetItemString(zip_directory_cache, path,
@@ -118,8 +144,6 @@ zipimporter_init(ZipImporter *self, PyObject *args, PyObject *kwds)
         PyErr_SetString(ZipImportError, "not a Zip file");
         return -1;
     }
-
-    prefix = "";
 
     self->archive = PyString_FromString(buf);
     if (self->archive == NULL)
@@ -148,7 +172,7 @@ zipimporter_dealloc(ZipImporter *self)
     Py_XDECREF(self->archive);
     Py_XDECREF(self->prefix);
     Py_XDECREF(self->files);
-    Py_XDECREF(zip_content);
+    Py_XDECREF(self->zip_content);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -421,7 +445,7 @@ zipimporter_get_data(PyObject *obj, PyObject *args)
         PyErr_SetFromErrnoWithFilename(PyExc_IOError, path);
         return NULL;
     }
-    return get_data(PyString_AsString(self->archive), toc_entry);
+    return get_data(PyString_AsString(self->archive), self->zip_content, toc_entry);
 }
 
 static PyObject *
@@ -471,7 +495,7 @@ zipimporter_get_source(PyObject *obj, PyObject *args)
 
     toc_entry = PyDict_GetItemString(self->files, path);
     if (toc_entry != NULL)
-        return get_data(PyString_AsString(self->archive), toc_entry);
+        return get_data(PyString_AsString(self->archive), self->zip_content, toc_entry);
 
     /* we have the module, but no source */
     Py_INCREF(Py_None);
@@ -638,7 +662,7 @@ get_short(unsigned char *buf) {
 }
 
 /*
-   read_directory(archive) -> files dict (new reference)
+   read_directory(archive, zip_content) -> files dict (new reference)
 
    Given a path to a Zip archive, build a dict, mapping file names
    (local to the archive, using SEP as a separator) to toc entries.
@@ -659,7 +683,7 @@ get_short(unsigned char *buf) {
    data_size and file_offset are 0.
 */
 static PyObject *
-read_directory(char *archive)
+read_directory(char *archive, PyObject *zip_content)
 {
     PyObject *files = NULL;
     long compress, crc, data_size, file_size, file_offset, date, time;
@@ -679,6 +703,11 @@ read_directory(char *archive)
     }
     strcpy(path, archive);
 
+    if(zip_content == NULL) {
+        PyErr_Format(ZipImportError, "zip content is empty: "
+                     "'%.200s'", archive);
+        return NULL;
+    }
     content = (unsigned char *)PyByteArray_AsString(zip_content);
     endof_central_dir = content + PyByteArray_Size(zip_content) - 22;
     header_position = PyByteArray_Size(zip_content) - 22;
@@ -802,7 +831,7 @@ get_decompress_func(void)
 /* Given a path to a Zip file and a toc_entry, return the (uncompressed)
    data as a new reference. */
 static PyObject *
-get_data(char *archive, PyObject *toc_entry)
+get_data(char *archive, PyObject *zip_content, PyObject *toc_entry)
 {
     PyObject *raw_data, *data = NULL, *decompress;
     char *buf;
@@ -819,6 +848,12 @@ get_data(char *archive, PyObject *toc_entry)
     }
 
     /* Check to make sure the local file header is correct */
+
+    if(zip_content == NULL) {
+        PyErr_Format(ZipImportError, "zip content is empty: "
+                     "'%.200s'", archive);
+        return NULL;
+    }
     content = PyByteArray_AsString(zip_content);
     l = get_long((unsigned char *)content);
     if (l != 0x04034B50) {
@@ -1045,7 +1080,7 @@ get_code_from_data(ZipImporter *self, int ispackage, int isbytecode,
     if (archive == NULL)
         return NULL;
 
-    data = get_data(archive, toc_entry);
+    data = get_data(archive, self->zip_content, toc_entry);
     if (data == NULL)
         return NULL;
 

@@ -1,10 +1,15 @@
-from distutils.core import setup, Extension
+import sys
+from setuptools import setup, Extension
+
+extra_compile_args = []
+if sys.platform != 'win32':
+    extra_compile_args.extend(["-Wall", "-g"])
+else:
+    extra_compile_args.extend(["/W4", "/Zi"])
 
 memzipimport = Extension("memzipimport",
                        sources=["memzipimport.c"],
-                       extra_compile_args=["/W4", # Highest warning level
-                                           "/Zi",  # Generate PDBs
-                                          ],
+                       extra_compile_args=extra_compile_args,
                       )
 
 setup(name="memzipimport",
@@ -14,4 +19,3 @@ setup(name="memzipimport",
       maintainer_email="zyobi@163.com",
       ext_modules=[memzipimport],
      )
-
